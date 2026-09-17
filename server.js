@@ -149,6 +149,40 @@ const enquiryAdminHtml = ({ name, email, phone, subject, message, reference }) =
     `,
   });
 
+const newsletterWelcomeHtml = ({ email, reference }) =>
+  wrapEmail({
+    title: `Welcome to the sweet list · Donut District`,
+    bodyHtml: `
+      <h1 style="margin:0 0 8px;font-size:22px;font-family:Georgia,'Times New Roman',serif;color:#3a2e26;">
+        You're on the list! 🍩
+      </h1>
+      <p style="margin:0 0 24px;font-size:14px;line-height:1.7;color:#5c4d40;">
+        Thank you for joining the Donut District newsletter. Every week we share the freshest
+        flavour drops, behind-the-scenes peeks at the counter, and subscriber-first treats we
+        don't post anywhere else.
+      </p>
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#f9f3e6;border-radius:14px;padding:16px 20px;">
+        <tr>
+          <td style="font-size:14px;line-height:1.9;color:#3a2e26;">
+            <strong>Here's what to expect:</strong><br />
+            ▪️ Weekly flavour drops before they hit the counter<br />
+            ▪️ Subscriber-only treats on the day's batch<br />
+            ▪️ First word on seasonal specials and pop-ups
+          </td>
+        </tr>
+      </table>
+      <p style="margin:24px 0 0;font-size:14px;line-height:1.7;color:#5c4d40;">
+        We've logged <strong>${escapeHtml(email)}</strong> on the list under reference
+        <strong>${escapeHtml(reference)}</strong>. Whenever you're ready to grab a box, you know
+        where to find us — baked fresh, every morning.
+      </p>
+      <p style="margin:24px 0 0;font-size:14px;color:#3a2e26;">
+        Warm regards,<br />
+        <span style="font-family:Georgia,'Times New Roman',serif;font-style:italic;">The Donut District Team</span>
+      </p>
+    `,
+  });
+
 /* ----------------------------- ZeptoMail client --------------------------- */
 
 const sendMail = async ({ to, toName, subject, html }) => {
