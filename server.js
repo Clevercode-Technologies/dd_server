@@ -18,7 +18,17 @@ const FROM_NAME = process.env.FROM_NAME || SUPPORT_NAME;
 
 // Internal inbox that receives admin copies
 const SHOP_EMAIL = process.env.SHOP_EMAIL || "donutdistrictfood@gmail.com";
+// Admin inbox that receives new orders (falls back to the shop inbox)
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL || SHOP_EMAIL;
 const SHOP_PHONE = process.env.SHOP_PHONE || "+234 701 429 8844";
+
+// Authoritative menu prices — the client's total is never trusted.
+const PRODUCT_PRICES = {
+  "Lagos Nutty Traffic": 1800,
+  "Milo Madness": 1600,
+  "Zobo Sweet Rush": 1700,
+  "Northern Spice Street": 1700,
+};
 
 const app = express();
 app.use(express.json({ limit: "100kb" }));
@@ -183,6 +193,98 @@ const newsletterWelcomeHtml = ({ email, reference }) =>
     `,
   });
 
+const naira = (value) => `₦${Number(value).toLocaleString("en-NG")}`;
+
+const orderItemsTableHtml = (items) => `
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#f9f3e6;border-radius:14px;padding:8px 20px;">
+        <tr>
+          <td style="padding:10px 0;border-bottom:1px solid #ece2cf;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#8a7a68;">Item</td>
+          <td style="padding:10px 0;border-bottom:1px solid #ece2cf;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#8a7a68;text-align:center;">Qty</td>
+          <td style="padding:10px 0;border-bottom:1px solid #ece2cf;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#8a7a68;text-align:right;">Amount</td>
+        </tr>
+        ${items
+          .map(
+            (item) => `
+        <tr>
+          <td style="padding:10px 0;border-bottom:1px solid #ece2cf;font-size:14px;color:#3a2e26;font-weight:600;">${escapeHtml(item.name)}</td>
+          <td style="padding:10px 0;border-bottom:1px solid #ece2cf;font-size:14px;color:#3a2e26;text-align:center;">${escapeHtml(item.quantity)}</td>
+          <td style="padding:10px 0;border-bottom:1px solid #ece2cf;font-size:14px;color:#3a2e26;text-align:right;">${escapeHtml(naira(item.lineTotal))}</td>
+        </tr>`,
+          )
+          .join("")}
+        <tr>
+          <td style="padding:12px 0;font-size:14px;color:#3a2e26;font-weight:700;" colspan="2">Total</td>
+          <td style="padding:12px 0;font-size:16px;color:#3a2e26;font-weight:700;text-align:right;">${escapeHtml(naira(items.reduce((sum, item) => sum + item.lineTotal, 0)))}</td>
+        </tr>
+      </table>`;
+
+const orderAckHtml = ({ name, reference, items, fulfillment, note }) =>
+  wrapEmail({
+    title: `Order received · Donut District`,
+    bodyHtml: `
+      <h1 style="margin:0 0 8px;font-size:22px;font-family:Georgia,'Times New Roman',serif;color:#3a2e26;">
+        Thank you, ${escapeHtml(name)}! 🍩
+      </h1>
+      <p style="margin:0 0 24px;font-size:14px;line-height:1.7;color:#5c4d40;">
+        We have received your order and our bakers are on it. We will reach out shortly to
+        confirm ${
+          fulfillment === "delivery"
+            ? "your delivery details and payment"
+            : "your pickup time and payment"
+        }. Keep this reference handy when you contact us.
+      </p>
+      <p style="margin:0 0 6px;font-size:11px;letter-spacing:2px;text-transform:uppercase;color:#c98d55;">Reference</p>
+      <p style="margin:0 0 24px;font-size:16px;font-weight:700;color:#3a2e26;">${escapeHtml(reference)}</p>
+      ${orderItemsTableHtml(items)}
+      <p style="margin:20px 0 6px;font-size:11px;letter-spacing:2px;text-transform:uppercase;color:#c98d55;">Fulfilment</p>
+      <p style="margin:0;font-size:14px;line-height:1.7;color:#5c4d40;">
+        ${escapeHtml(fulfillment === "delivery" ? "Delivery across Benin City" : "Pickup at the counter")}${
+          note ? `<br /><span style="color:#8a7a68;">Note: ${escapeHtml(note)}</span>` : ""
+        }
+      </p>
+      <p style="margin:24px 0 0;font-size:14px;color:#3a2e26;">
+        Warm regards,<br />
+        <span style="font-family:Georgia,'Times New Roman',serif;font-style:italic;">The Donut District Team</span>
+      </p>
+    `,
+  });
+
+const orderAdminHtml = ({ name, email, phone, reference, items, fulfillment, note }) =>
+  wrapEmail({
+    title: `New order ${reference} · Donut District`,
+    bodyHtml: `
+      <h1 style="margin:0 0 16px;font-size:20px;font-family:Georgia,'Times New Roman',serif;color:#3a2e26;">
+        New order — ${escapeHtml(reference)}
+      </h1>
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#f9f3e6;border-radius:14px;padding:8px 20px;">
+        <tr>
+          <td style="padding:10px 0;border-bottom:1px solid #ece2cf;font-size:13px;color:#8a7a68;width:90px;">Customer</td>
+          <td style="padding:10px 0;border-bottom:1px solid #ece2cf;font-size:14px;color:#3a2e26;font-weight:600;">${escapeHtml(name)}</td>
+        </tr>
+        <tr>
+          <td style="padding:10px 0;border-bottom:1px solid #ece2cf;font-size:13px;color:#8a7a68;">Email</td>
+          <td style="padding:10px 0;border-bottom:1px solid #ece2cf;font-size:14px;color:#3a2e26;">${escapeHtml(email)}</td>
+        </tr>
+        <tr>
+          <td style="padding:10px 0;border-bottom:1px solid #ece2cf;font-size:13px;color:#8a7a68;">Phone</td>
+          <td style="padding:10px 0;border-bottom:1px solid #ece2cf;font-size:14px;color:#3a2e26;">${escapeHtml(phone)}</td>
+        </tr>
+        <tr>
+          <td style="padding:10px 0;font-size:13px;color:#8a7a68;">Fulfilment</td>
+          <td style="padding:10px 0;font-size:14px;color:#3a2e26;font-weight:600;">${escapeHtml(fulfillment === "delivery" ? "Delivery" : "Pickup")}</td>
+        </tr>
+      </table>
+      <p style="margin:20px 0 6px;font-size:11px;letter-spacing:2px;text-transform:uppercase;color:#c98d55;">Items</p>
+      ${orderItemsTableHtml(items)}
+      ${
+        note
+          ? `<p style="margin:20px 0 6px;font-size:11px;letter-spacing:2px;text-transform:uppercase;color:#c98d55;">Note</p>
+       <p style="margin:0;font-size:14px;line-height:1.8;color:#3a2e26;white-space:pre-line;">${escapeHtml(note)}</p>`
+          : ""
+      }
+    `,
+  });
+
 /* ----------------------------- ZeptoMail client --------------------------- */
 
 const sendMail = async ({ to, toName, subject, html }) => {
@@ -321,6 +423,87 @@ app.post("/api/newsletter", async (req, res) => {
       ok: false,
       reference,
       message: "We could not add you to the list just yet — please try again in a moment.",
+    });
+  }
+});
+
+/* --------------------------------- orders --------------------------------- */
+
+app.post("/api/order", async (req, res) => {
+  const body = req.body ?? {};
+  const name = String(body.name ?? "").trim();
+  const email = String(body.email ?? "").trim();
+  const phone = String(body.phone ?? "").trim();
+  const fulfillment = body.fulfillment === "delivery" ? "delivery" : "pickup";
+  const note = String(body.note ?? "").trim().slice(0, 1000);
+
+  // --- validation -----------------------------------------------------------
+  const errors = [];
+  if (name.length < 2) errors.push("Please tell us your name.");
+  if (!isEmail(email))
+    errors.push("Please provide a valid email address so we can send you an order confirmation.");
+  if (phone.replace(/\D/g, "").length < 7)
+    errors.push("Please provide a valid phone number so we can confirm your order.");
+
+  // Rebuild the items from the trusted price list instead of trusting the client.
+  const rawItems = Array.isArray(body.items) ? body.items : [];
+  const items = rawItems
+    .map((item) => {
+      const productName = String(item?.name ?? "").trim();
+      const quantity = Math.floor(Number(item?.quantity ?? 0));
+      if (!Object.prototype.hasOwnProperty.call(PRODUCT_PRICES, productName) || quantity <= 0) {
+        return null;
+      }
+      return {
+        name: productName,
+        quantity,
+        unitPrice: PRODUCT_PRICES[productName],
+        lineTotal: PRODUCT_PRICES[productName] * quantity,
+      };
+    })
+    .filter(Boolean);
+
+  if (items.length === 0) errors.push("Add at least one donut to send your order.");
+  if (fulfillment === "delivery" && note.length < 5)
+    errors.push("Please add a delivery address so we know where to bring your donuts.");
+
+  if (errors.length > 0) {
+    return res.status(400).json({ ok: false, message: errors[0], errors });
+  }
+
+  const total = items.reduce((sum, item) => sum + item.lineTotal, 0);
+  const reference = ticketRef("ORD");
+  const order = { name, email, phone, reference, items, fulfillment, note, total };
+
+  // --- emails ---------------------------------------------------------------
+  try {
+    await Promise.all([
+      sendMail({
+        to: email,
+        toName: name,
+        subject: `We have received your order 🍩 — ${reference}`,
+        html: orderAckHtml(order),
+      }),
+      sendMail({
+        to: ADMIN_EMAIL,
+        toName: "Donut District",
+        subject: `New order ${reference} · ${naira(total)} · ${name}`,
+        html: orderAdminHtml(order),
+      }),
+    ]);
+
+    return res.status(201).json({
+      ok: true,
+      reference,
+      message: `Thank you, ${name}. Your order is in — a confirmation is on its way to ${email}.`,
+    });
+  } catch (error) {
+    console.error(`[order ${reference}] mail delivery failed:`, error.message);
+    return res.status(502).json({
+      ok: false,
+      reference,
+      message:
+        "Your order could not be sent right now — please try again in a moment or give us a call.",
     });
   }
 });
