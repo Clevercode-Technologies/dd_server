@@ -1,7 +1,22 @@
 import express from "express";
 import * as dotenv from "dotenv";
+import dns from "node:dns";
+import net from "node:net";
+import { pathToFileURL } from "node:url";
 
 dotenv.config();
+
+/* --------------------- outbound network preferences ----------------------- */
+
+// Some networks (including the one this server was debugged on) resolve
+// api.zeptomail.com to a NAT64 IPv6 address that is unroutable. Node's
+// happy-eyeballs address selection then waits for it to time out, which surfaces
+// only as "fetch failed" / ETIMEDOUT. Prefer IPv4, which ZeptoMail serves
+// reliably. Set MAIL_FORCE_IPV4=false to opt out.
+if (String(process.env.MAIL_FORCE_IPV4 ?? "true").toLowerCase() !== "false") {
+  net.setDefaultAutoSelectFamily?.(false);
+  dns.setDefaultResultOrder?.("ipv4first");
+}
 
 /* ----------------------------- configuration ----------------------------- */
 
@@ -30,6 +45,12 @@ const PRODUCT_PRICES = {
   "Northern Spice Street": 1700,
 };
 
+// Mail failures include a concise `detail` field in the API response so a broken
+// deployment can be diagnosed without shell access. Set EXPOSE_ERROR_DETAILS=false
+// to fall back to generic customer-facing messages.
+const EXPOSE_ERROR_DETAILS =
+  String(process.env.EXPOSE_ERROR_DETAILS ?? "true").toLowerCase() !== "false";
+
 const app = express();
 app.use(express.json({ limit: "100kb" }));
 
@@ -42,6 +63,18 @@ app.use((req, res, next) => {
   if (req.method === "OPTIONS") {
     return res.sendStatus(204);
   }
+  next();
+});
+
+/* ------------------------------ request log ------------------------------ */
+
+app.use((req, res, next) => {
+  const startedAt = Date.now();
+  res.on("finish", () => {
+    console.log(
+      `[http] ${req.method} ${req.originalUrl} → ${res.statusCode} (${Date.now() - startedAt}ms)`,
+    );
+  });
   next();
 });
 
@@ -287,9 +320,39 @@ const orderAdminHtml = ({ name, email, phone, reference, items, fulfillment, not
 
 /* ----------------------------- ZeptoMail client --------------------------- */
 
-const sendMail = async ({ to, toName, subject, html }) => {
+/** Walks Node's nested `cause` chain — "fetch failed" hides the real DNS/TLS/socket error. */
+const describeCauseChain = (error) => {
+  const parts = [];
+  const seen = new Set();
+  let current = error;
+
+  while (current && !seen.has(current) && parts.length < 4) {
+    seen.add(current);
+    const code = current.code ?? current.errno;
+    const message = current.message ?? String(current);
+    parts.push(code && !message.includes(String(code)) ? `${message} (${code})` : message);
+    current = current.cause;
+  }
+
+  return parts.join(" ← ") || "unknown network error";
+};
+
+/** Human-readable reason for a failed send — never swallow the provider's answer. */
+const describeMailError = (error) => {
+  if (!error) return "unknown error";
+  const status = error.status ? `HTTP ${error.status} — ` : "";
+  const message = error.message ?? String(error);
+  const provider = error.providerDetail ? ` · provider said: ${error.providerDetail}` : "";
+  return `${status}${message}${provider}`;
+};
+
+const zeptoMailTransport = async ({ to, toName, subject, html }) => {
   if (!ZEPTOMAIL_TOKEN) {
-    throw new Error("ZeptoMail API token is not configured (set API_TOKEN in .env)");
+    const error = new Error(
+      "ZEPTOMAIL_API_TOKEN is not configured on this server (checked API_TOKEN and ZEPTOMAIL_API_TOKEN)",
+    );
+    error.code = "MAIL_TOKEN_MISSING";
+    throw error;
   }
 
   // ZeptoMail expects the token prefixed with "Zoho-enczapikey" unless already provided.
@@ -297,33 +360,97 @@ const sendMail = async ({ to, toName, subject, html }) => {
     ? ZEPTOMAIL_TOKEN
     : `Zoho-enczapikey ${ZEPTOMAIL_TOKEN}`;
 
-  const response = await fetch(`https://${ZEPTOMAIL_HOST}/v1.1/email`, {
-    method: "POST",
-    headers: {
-      Authorization: authorization,
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    },
-    body: JSON.stringify({
-      from: { address: FROM_EMAIL, name: FROM_NAME },
-      to: [{ email_address: { address: to, name: toName } }],
-      subject,
-      htmlbody: html,
-    }),
-  });
+  let response;
+  try {
+    response = await fetch(`https://${ZEPTOMAIL_HOST}/v1.1/email`, {
+      method: "POST",
+      headers: {
+        Authorization: authorization,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({
+        from: { address: FROM_EMAIL, name: FROM_NAME },
+        to: [{ email_address: { address: to, name: toName } }],
+        subject,
+        htmlbody: html,
+      }),
+    });
+  } catch (cause) {
+    // Network-level failure (wrong HOST, DNS, TLS, timeouts) — keep the whole cause chain visible.
+    const error = new Error(`Could not reach ${ZEPTOMAIL_HOST} — ${describeCauseChain(cause)}`);
+    error.code = "MAIL_NETWORK_ERROR";
+    error.cause = cause;
+    throw error;
+  }
 
   if (!response.ok) {
     const detail = await response.text().catch(() => "");
-    throw new Error(`ZeptoMail responded ${response.status}: ${detail.slice(0, 500)}`);
+    const error = new Error(`ZeptoMail rejected the message (status ${response.status})`);
+    error.status = response.status;
+    error.providerDetail = detail.slice(0, 500);
+    throw error;
   }
 
   return response.json().catch(() => ({}));
 };
 
+// Swappable so tests (or a future provider) can replace the transport.
+let mailTransport = zeptoMailTransport;
+const setMailTransport = (transport) => {
+  mailTransport = transport;
+};
+
+/**
+ * Sends every message independently and logs each outcome with its recipient and
+ * subject, so a partial failure can never pass silently again.
+ */
+const deliverAll = async (messages) => {
+  const settled = await Promise.allSettled(
+    messages.map(({ to, toName, subject, html }) => mailTransport({ to, toName, subject, html })),
+  );
+
+  settled.forEach((result, index) => {
+    const { to, subject } = messages[index];
+    if (result.status === "fulfilled") {
+      console.log(`[mail] sent → ${to} · "${subject}"`);
+    } else {
+      console.error(`[mail] FAILED → ${to} · "${subject}" · ${describeMailError(result.reason)}`);
+    }
+  });
+
+  return settled;
+};
+
+const firstMailFailure = (settled) =>
+  settled.find((result) => result.status === "rejected")?.reason ?? null;
+
+/** Non-secret view of the mail configuration, safe to expose on /api/health. */
+const mailConfigSnapshot = () => ({
+  host: ZEPTOMAIL_HOST,
+  tokenConfigured: Boolean(ZEPTOMAIL_TOKEN),
+  tokenPrefixed: ZEPTOMAIL_TOKEN.startsWith("Zoho-"),
+  tokenLength: ZEPTOMAIL_TOKEN.length,
+  from: FROM_EMAIL,
+  supportInbox: SHOP_EMAIL,
+  adminInbox: ADMIN_EMAIL,
+  exposeErrorDetails: EXPOSE_ERROR_DETAILS,
+});
+
+/** Adds a diagnostic `detail` field to failure responses while debugging is on. */
+const failurePayload = (error) =>
+  EXPOSE_ERROR_DETAILS ? { detail: describeMailError(error) } : {};
+
 /* --------------------------------- routes --------------------------------- */
 
 app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, service: "donut-district-mail-server", timestamp: new Date().toISOString() });
+  res.json({
+    ok: true,
+    service: "donut-district-mail-server",
+    timestamp: new Date().toISOString(),
+    uptimeSeconds: Math.round(process.uptime()),
+    mail: mailConfigSnapshot(),
+  });
 });
 app.post("/api/enquiry", async (req, res) => {
   const body = req.body ?? {};
@@ -351,20 +478,32 @@ app.post("/api/enquiry", async (req, res) => {
 
   // --- emails --------------------------------------------------------------
   try {
-    await Promise.all([
-      sendMail({
+    const settled = await deliverAll([
+      {
         to: email,
         toName: name,
         subject: `We have received your enquiry — ${reference}`,
         html: enquiryAckHtml(enquiry),
-      }),
-      sendMail({
+      },
+      {
         to: SHOP_EMAIL,
         toName: "Donut District",
         subject: `New enquiry ${reference} · ${subject} · ${name}`,
         html: enquiryAdminHtml(enquiry),
-      }),
+      },
     ]);
+
+    const failure = firstMailFailure(settled);
+    if (failure) {
+      console.error(`[enquiry ${reference}] delivery incomplete · ${describeMailError(failure)}`);
+      return res.status(502).json({
+        ok: false,
+        reference,
+        message:
+          "Your enquiry reached us, but the confirmation email could not be dispatched right now. Please try again shortly or reach us on the phone line.",
+        ...failurePayload(failure),
+      });
+    }
 
     return res.status(201).json({
       ok: true,
@@ -372,12 +511,12 @@ app.post("/api/enquiry", async (req, res) => {
       message: `Thank you, ${name}. Your enquiry is with our team — expect a reply at ${email} within 24 hours.`,
     });
   } catch (error) {
-    console.error(`[enquiry ${reference}] mail delivery failed:`, error.message);
-    return res.status(502).json({
+    console.error(`[enquiry ${reference}] unexpected failure:`, error);
+    return res.status(500).json({
       ok: false,
       reference,
-      message:
-        "Your enquiry reached us, but the confirmation email could not be dispatched right now. Please try again shortly or reach us on the phone line.",
+      message: "Something went wrong while preparing your enquiry.",
+      ...failurePayload(error),
     });
   }
 });
@@ -397,20 +536,31 @@ app.post("/api/newsletter", async (req, res) => {
 
   const reference = ticketRef("SUB");
   try {
-    await Promise.all([
-      sendMail({
+    const settled = await deliverAll([
+      {
         to: email,
         toName: "New subscriber",
         subject: "Welcome to the Donut District newsletter 🍩",
         html: newsletterWelcomeHtml({ email, reference }),
-      }),
-      sendMail({
+      },
+      {
         to: SHOP_EMAIL,
         toName: "Donut District",
         subject: `New newsletter subscriber · ${email}`,
         html: `<p>New subscriber: ${escapeHtml(email)} (ref ${escapeHtml(reference)})</p>`,
-      }),
+      },
     ]);
+
+    const failure = firstMailFailure(settled);
+    if (failure) {
+      console.error(`[newsletter ${reference}] delivery incomplete · ${describeMailError(failure)}`);
+      return res.status(502).json({
+        ok: false,
+        reference,
+        message: "We could not add you to the list just yet — please try again in a moment.",
+        ...failurePayload(failure),
+      });
+    }
 
     return res.status(201).json({
       ok: true,
@@ -418,11 +568,12 @@ app.post("/api/newsletter", async (req, res) => {
       message: "You're on the list! Check your inbox for a sweet welcome note.",
     });
   } catch (error) {
-    console.error(`[newsletter ${reference}] mail delivery failed:`, error.message);
-    return res.status(502).json({
+    console.error(`[newsletter ${reference}] unexpected failure:`, error);
+    return res.status(500).json({
       ok: false,
       reference,
-      message: "We could not add you to the list just yet — please try again in a moment.",
+      message: "Something went wrong while subscribing you.",
+      ...failurePayload(error),
     });
   }
 });
@@ -477,37 +628,77 @@ app.post("/api/order", async (req, res) => {
 
   // --- emails ---------------------------------------------------------------
   try {
-    await Promise.all([
-      sendMail({
+    const settled = await deliverAll([
+      {
         to: email,
         toName: name,
         subject: `We have received your order 🍩 — ${reference}`,
         html: orderAckHtml(order),
-      }),
-      sendMail({
+      },
+      {
         to: ADMIN_EMAIL,
         toName: "Donut District",
         subject: `New order ${reference} · ${naira(total)} · ${name}`,
         html: orderAdminHtml(order),
-      }),
+      },
     ]);
 
+    const [customerMail, adminMail] = settled;
+    const adminError = adminMail.status === "rejected" ? adminMail.reason : null;
+    const customerError = customerMail.status === "rejected" ? customerMail.reason : null;
+
+    // The kitchen must receive the order, otherwise the customer needs to be told.
+    if (adminError) {
+      console.error(`[order ${reference}] admin copy failed · ${describeMailError(adminError)}`);
+      return res.status(502).json({
+        ok: false,
+        reference,
+        message:
+          "Your order could not be sent right now — please try again in a moment or give us a call.",
+        ...failurePayload(adminError),
+      });
+    }
+
+    // Order landed with the kitchen; a failed receipt must stay visible but never block it.
     return res.status(201).json({
       ok: true,
       reference,
       message: `Thank you, ${name}. Your order is in — a confirmation is on its way to ${email}.`,
+      ...(customerError
+        ? {
+            warning: `Order received, but the confirmation email to ${email} could not be delivered.`,
+            ...failurePayload(customerError),
+          }
+        : {}),
     });
   } catch (error) {
-    console.error(`[order ${reference}] mail delivery failed:`, error.message);
-    return res.status(502).json({
+    console.error(`[order ${reference}] unexpected failure:`, error);
+    return res.status(500).json({
       ok: false,
       reference,
-      message:
-        "Your order could not be sent right now — please try again in a moment or give us a call.",
+      message: "Something went wrong while placing your order.",
+      ...failurePayload(error),
     });
   }
 });
 
 /* -------------------------------- startup -------------------------------- */
 
-app.listen(PORT, () => console.log(`Donut District mail server running on PORT: ${PORT}`));
+// Only bind a port when this file is executed directly (`npm start`), so tests and
+// other imports can use the exported app without starting a listener.
+const isDirectRun = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (isDirectRun) {
+  app.listen(PORT, () => {
+    console.log(`Donut District mail server running on PORT: ${PORT}`);
+    console.log(`[config] ${JSON.stringify(mailConfigSnapshot())}`);
+
+    if (!ZEPTOMAIL_TOKEN) {
+      console.error(
+        "[config] ZEPTOMAIL_API_TOKEN is missing — every enquiry, order and newsletter will fail with a 502 until it is set and the service is redeployed",
+      );
+    }
+  });
+}
+
+export { app, describeCauseChain, mailConfigSnapshot, setMailTransport };
